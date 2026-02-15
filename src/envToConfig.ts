@@ -4,50 +4,6 @@
 
 import fs from 'node:fs/promises';
 
-type ConfigFromEnv = {
-	tachyonServer?: string;
-	tachyonServerPort?: number;
-	useSecureConnection?: boolean;
-	authClientId?: string;
-	authClientSecret?: string;
-	hostingIP?: string;
-	engineBindIP?: string;
-	maxReconnectDelaySeconds?: number;
-	engineSettings?: Record<string, string>;
-	maxBattles?: number;
-	maxUpdatesSubscriptionAgeSeconds?: number;
-	engineStartPort?: number;
-	engineAutohostStartPort?: number;
-	maxPortsUsed?: number;
-	engineInstallTimeoutSeconds?: number;
-	maxGameDurationSeconds?: number;
-};
-
-function parseBoolean(raw: string | undefined): boolean | undefined {
-	if (raw === undefined) {
-		return undefined;
-	}
-	const normalized = raw.trim().toLowerCase();
-	if (normalized === 'true' || normalized === '1') {
-		return true;
-	}
-	if (normalized === 'false' || normalized === '0') {
-		return false;
-	}
-	return undefined;
-}
-
-function parseNumber(raw: string | undefined): number | undefined {
-	if (raw === undefined || raw.trim() === '') {
-		return undefined;
-	}
-	const parsed = Number(raw);
-	if (Number.isNaN(parsed)) {
-		return undefined;
-	}
-	return parsed;
-}
-
 function parseStringMap(raw: string | undefined): Record<string, string> | undefined {
 	if (raw === undefined || raw.trim() === '') {
 		return undefined;
@@ -73,25 +29,33 @@ function parseStringMap(raw: string | undefined): Record<string, string> | undef
 	}
 }
 
-function readConfigFromEnv(env: NodeJS.ProcessEnv): ConfigFromEnv {
-	return {
+function readConfigFromEnv(env: NodeJS.ProcessEnv): Record<string, unknown> {
+	const config: Record<string, unknown> = {
 		tachyonServer: env['tachyonServer'],
-		tachyonServerPort: parseNumber(env['tachyonServerPort']),
-		useSecureConnection: parseBoolean(env['useSecureConnection']),
+		tachyonServerPort: env['tachyonServerPort'],
+		useSecureConnection: env['useSecureConnection'],
 		authClientId: env['authClientId'],
 		authClientSecret: env['authClientSecret'],
 		hostingIP: env['hostingIP'],
 		engineBindIP: env['engineBindIP'],
-		maxReconnectDelaySeconds: parseNumber(env['maxReconnectDelaySeconds']),
+		maxReconnectDelaySeconds: env['maxReconnectDelaySeconds'],
 		engineSettings: parseStringMap(env['engineSettings']),
-		maxBattles: parseNumber(env['maxBattles']),
-		maxUpdatesSubscriptionAgeSeconds: parseNumber(env['maxUpdatesSubscriptionAgeSeconds']),
-		engineStartPort: parseNumber(env['engineStartPort']),
-		engineAutohostStartPort: parseNumber(env['engineAutohostStartPort']),
-		maxPortsUsed: parseNumber(env['maxPortsUsed']),
-		engineInstallTimeoutSeconds: parseNumber(env['engineInstallTimeoutSeconds']),
-		maxGameDurationSeconds: parseNumber(env['maxGameDurationSeconds'])
+		maxBattles: env['maxBattles'],
+		maxUpdatesSubscriptionAgeSeconds: env['maxUpdatesSubscriptionAgeSeconds'],
+		engineStartPort: env['engineStartPort'],
+		engineAutohostStartPort: env['engineAutohostStartPort'],
+		maxPortsUsed: env['maxPortsUsed'],
+		engineInstallTimeoutSeconds: env['engineInstallTimeoutSeconds'],
+		maxGameDurationSeconds: env['maxGameDurationSeconds'],
 	};
+
+	for (const [key, value] of Object.entries(config)) {
+		if (value === undefined) {
+			delete config[key];
+		}
+	}
+
+	return config;
 }
 
 async function main(argv: string[]) {
