@@ -43,10 +43,15 @@ running dedicated [Recoil] engine processes and lobby server (for example
 Currently the service implements fully the Tachyon Autohost endpoints but isn't
 yet fully ready for production deployments.
 
+Engine versions can be installed on-demand using the Tachyon
+`autohost/installEngine` request. The service downloads and extracts the
+requested version into `engines/<version>/`.
+
 ## Usage
 
-Autohost takes a single JSON configuration file as argument and starts the
-operation:
+Autohost starts from a JSON config file.
+
+Config file mode:
 
 ```shell
 npm install
@@ -61,11 +66,20 @@ A minimal configuration file looks like:
   "tachyonServer": "lobby-server.example.com",
   "authClientId": "autohost1",
   "authClientSecret": "pass1",
-  "hostingIP": "123.123.123.123"
+  "hostingIP": "123.123.123.123",
+  "engineBindIP": "0.0.0.0"
 }
 ```
 
 To see all options take a look at schema in [`src/config.ts`](./src/config.ts).
+In Docker, the entrypoint generates this config file from environment variables
+with matching names (for example `tachyonServerPort`, `useSecureConnection`,
+`engineStartPort`, `maxPortsUsed`, `engineBindIP`).
+
+`hostingIP` is the address advertised to clients. `engineBindIP` is the local
+interface address used by the engine server socket. In containerized setups,
+`hostingIP=127.0.0.1` with `engineBindIP=0.0.0.0` is commonly useful for local
+host testing.
 
 Autohost expects existence of `engines` folder that contains folder with
 different engine versions, for example:
