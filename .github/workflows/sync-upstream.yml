@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 The Recoil Autohost Authors
+#
+# SPDX-License-Identifier: CC0-1.0
+
 name: Sync with upstream
 
 on:
