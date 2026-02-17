@@ -25,6 +25,7 @@ import {
 	PlayerChatUpdate,
 	PlayerLeftUpdate,
 } from 'tachyon-protocol/types';
+import { randomUUID } from 'node:crypto';
 import {
 	serializeMessagePacket,
 	serializeCommandPacket,
@@ -149,17 +150,18 @@ export class Autohost implements TachyonAutohost {
 	}
 
 	async start(req: AutohostStartRequestData): Promise<AutohostStartOkResponseData> {
-		const { ip, port } = await this.gamesMgr.start(req);
+		const { startRequest, spectatorClient } = normalizeBotOnlyStartRequest(req);
+		const { ip, port } = await this.gamesMgr.start(startRequest, spectatorClient);
 
 		const players: MultiIndex<PlayerIds> = new MultiIndex({
 			userId: '',
 			name: '',
 			playerNumber: 0,
 		});
-		for (const playerIds of _getPlayerIds(req)) {
+		for (const playerIds of _getPlayerIds(startRequest)) {
 			players.set(playerIds);
 		}
-		this.battlePlayers.set(req.battleId, players);
+		this.battlePlayers.set(startRequest.battleId, players);
 
 		return { ips: [ip], port };
 	}
@@ -325,6 +327,98 @@ export class Autohost implements TachyonAutohost {
 			);
 		}
 	}
+}
+
+function normalizeBotOnlyStartRequest(req: AutohostStartRequestData): {
+	startRequest: AutohostStartRequestData;
+	spectatorClient?: {
+		name: string;
+		password: string;
+	};
+} {
+	const hasHumanPlayers = req.allyTeams.some((at) =>
+		at.teams.some((team) => (team.players ?? []).length > 0),
+	);
+	if (hasHumanPlayers) {
+		return { startRequest: req };
+	}
+
+	const botHostIds = new Set(
+		req.allyTeams
+			.flatMap((at) => at.teams)
+			.flatMap((team) => team.bots ?? [])
+			.map((bot) => bot.hostUserId),
+	);
+
+	const existingSpectator = (req.spectators ?? []).find((spectator) =>
+		botHostIds.has(spectator.userId),
+	);
+
+	if (existingSpectator?.password) {
+		const spectatorName = toEnginePlayerName(existingSpectator.name);
+		const startRequest: AutohostStartRequestData = {
+			...req,
+			allyTeams: req.allyTeams.map((allyTeam) => ({
+				...allyTeam,
+				teams: allyTeam.teams.map((team) => ({
+					...team,
+					bots: (team.bots ?? []).map((bot) => ({
+						...bot,
+						hostUserId: existingSpectator.userId,
+					})),
+				})),
+			})),
+			spectators: (req.spectators ?? []).map((spectator) =>
+				spectator.userId === existingSpectator.userId
+					? {
+						...spectator,
+						name: spectatorName,
+					}
+					: spectator,
+			),
+		};
+
+		return {
+			startRequest,
+			spectatorClient: {
+				name: spectatorName,
+				password: existingSpectator.password,
+			},
+		};
+	}
+
+	const autohostSpectator = {
+		userId: randomUUID(),
+		name: `autohost-${req.battleId}`,
+		password: randomUUID(),
+	};
+
+	const startRequest: AutohostStartRequestData = {
+		...req,
+		allyTeams: req.allyTeams.map((allyTeam) => ({
+			...allyTeam,
+			teams: allyTeam.teams.map((team) => ({
+				...team,
+				bots: (team.bots ?? []).map((bot) => ({
+					...bot,
+					hostUserId: autohostSpectator.userId,
+				})),
+			})),
+		})),
+		spectators: [...(req.spectators ?? []), autohostSpectator],
+	};
+
+	return {
+		startRequest,
+		spectatorClient: {
+			name: autohostSpectator.name,
+			password: autohostSpectator.password,
+		},
+	};
+}
+
+function toEnginePlayerName(name: string): string {
+	return name.trim().replace(/\s+/g, '_');
 }
 
 function toTachyonLeaveReason(reason: LeaveReason): PlayerLeftUpdate['reason'] {

@@ -12,7 +12,11 @@ import * as fs from 'node:fs/promises';
 import * as tdf from 'recoil-tdf';
 import { TypedEmitter } from 'tiny-typed-emitter';
 import { parsePacket, type Event, EventType, PacketParseError } from './engineAutohostInterface.js';
-import { engineBinaryName } from './engineBinary.js';
+import {
+	engineBinaryName,
+	engineClientBinaryName,
+	engineHeadlessBinaryName,
+} from './engineBinary.js';
 import { scriptGameFromStartRequest, StartScriptGenError } from './startScriptGen.js';
 import type { AutohostStartRequestData } from 'tachyon-protocol/types';
 import { TachyonError } from './tachyonTypes.js';
@@ -71,6 +75,11 @@ interface Opts {
 	autohostPort: number;
 	hostIP: string;
 	hostPort: number;
+	spectatorClient?: {
+		hostIP: string;
+		name: string;
+		password: string;
+	};
 }
 
 export interface EngineRunner extends TypedEmitter<EngineRunnerEvents> {
@@ -84,6 +93,11 @@ interface Mocks {
 
 interface Config {
 	engineSettings: { [k: string]: string };
+	engineInstallTimeoutSeconds?: number;
+	engineDownloadMaxAttempts?: number;
+	engineDownloadRetryBackoffBaseMs?: number;
+	engineCdnBaseUrl?: string;
+	rapidRepoMasterUrl?: string;
 }
 
 export type Env = Environment<Config, Mocks>;
@@ -98,10 +112,14 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 	private udpServer: null | dgram.Socket = null;
 	private engineAutohostPort: number = 0;
 	private engineProcess: null | ChildProcess = null;
+	private spectatorProcess: null | ChildProcess = null;
 	private engineSpawned: boolean = false;
+	private spectatorSpawned: boolean = false;
 	private state: State = State.None;
 	private logger: Env['logger'];
 	private luamsgRegex: RegExp | null = null;
+	private opts: Opts | null = null;
+	private instanceDir: string | null = null;
 
 	public constructor(private env: Env) {
 		super();
@@ -115,6 +133,7 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 	 *             that can be used for testing.
 	 */
 	public _run(opts: Opts) {
+		this.opts = opts;
 		this.logger = this.logger.child({ battleId: opts.startRequest.battleId });
 		if (this.state != State.None) {
 			throw new Error('EngineRunner already started');
@@ -130,6 +149,7 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 			}
 
 			const instanceDir = await this.setupInstanceDir(opts);
+			this.instanceDir = instanceDir;
 			await this.startUdpServer(opts.autohostPort);
 			await this.startEngine(instanceDir, opts.startRequest);
 
@@ -173,6 +193,7 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 		// TODO: handle instance dir somehow?
 
 		this.killEngine();
+		this.killSpectator();
 		if (this.udpServer) {
 			this.udpServer.close();
 		}
@@ -204,6 +225,24 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 		}
 	}
 
+	private killSpectator(): void {
+		if (this.spectatorProcess == null || !this.spectatorSpawned) return;
+
+		const spectatorSigKill = setTimeout(() => {
+			this.logger.warn("Spectator didn't exit after SIGTERM, trying with SIGKILL");
+			this.spectatorProcess?.kill('SIGKILL');
+		}, 10000);
+
+		this.spectatorProcess.once('exit', () => {
+			clearTimeout(spectatorSigKill);
+		});
+
+		if (!this.spectatorProcess.kill('SIGTERM')) {
+			this.spectatorProcess.unref();
+			this.logger.warn('Failed to SIGTERM spectator process, it might linger');
+		}
+	}
+
 	private maybeEmitExit(): void {
 		// We can only emit exit when both the engine and the UDP server are
 		// stopped because we need to ensure that autohost UDP port isn't used
@@ -212,7 +251,12 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 		//    autohost port is still in use and we can't start new server.
 		//  - if the UDP server is stopped but the engine is still running, the
 		//	  engine might still be sending packets to the autohost port.
-		if (this.state == State.Stopping && this.engineProcess == null && this.udpServer == null) {
+		if (
+			this.state == State.Stopping &&
+			this.engineProcess == null &&
+			this.spectatorProcess == null &&
+			this.udpServer == null
+		) {
 			this.state = State.Stopped;
 			// Must be in next tick because we can get here directly from the close call
 			// and not all listeners might be attached yet.
@@ -255,6 +299,9 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 				}
 				this.engineAutohostPort = rinfo.port;
 				this.state = State.Running;
+				this.startSpectator().catch((err) => {
+					this.logger.warn(err, 'failed to start spectator sidecar');
+				});
 				this.emit('start');
 			}
 			if (this.engineAutohostPort != rinfo.port) {
@@ -282,6 +329,210 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 				this.logger.error(err, 'Unexpected error when handling packet');
 			}
 		}
+	}
+
+	private async startSpectator(): Promise<void> {
+		if (!this.opts?.spectatorClient || !this.instanceDir) {
+			return;
+		}
+
+		const engineDir = path.resolve('engines', this.opts.startRequest.engineVersion);
+		await this.ensureGameContent(engineDir, this.opts.startRequest.gameName);
+		const spectatorDir = path.join(this.instanceDir, 'spectator');
+		await fs.mkdir(spectatorDir, { recursive: true });
+
+		const script = tdf.serialize({
+			GAME: {
+				HostIP: this.opts.spectatorClient.hostIP,
+				HostPort: this.opts.hostPort,
+				GameType: this.opts.startRequest.gameName,
+				MyPlayerName: this.opts.spectatorClient.name,
+				MyPasswd: this.opts.spectatorClient.password,
+				IsHost: 0,
+			},
+		});
+		const scriptPath = path.join(spectatorDir, 'script.txt');
+		await fs.writeFile(scriptPath, script);
+
+		const spectatorBinPath = await this.resolveSpectatorBinary(engineDir);
+
+		this.spectatorProcess = (this.env.mocks?.spawn ?? spawn)(
+			spectatorBinPath,
+			[scriptPath],
+			{
+				cwd: spectatorDir,
+				stdio: 'ignore',
+				env: {
+					...process.env,
+					// Share the same data directories as the host so spectator can find
+					// game/map content downloaded by pr-downloader in the working directory.
+					SPRING_DATADIR: path.resolve('.'),
+					SPRING_WRITEDIR: spectatorDir,
+				},
+			},
+		);
+
+		this.spectatorProcess.on('spawn', () => {
+			this.spectatorSpawned = true;
+			if (this.state == State.Stopping) {
+				this.killSpectator();
+			}
+		});
+
+		this.spectatorProcess.on('error', (err) => {
+			if (!this.spectatorSpawned) {
+				this.spectatorProcess = null;
+				this.maybeEmitExit();
+			}
+			this.logger.warn(err, 'spectator sidecar process errored');
+		});
+
+		this.spectatorProcess.on('exit', (code, signal) => {
+			this.spectatorProcess = null;
+			if (this.state < State.Stopping && code !== 0) {
+				this.logger.warn(
+					{ code, signal },
+					'spectator sidecar exited unexpectedly, continuing battle',
+				);
+			}
+			this.maybeEmitExit();
+		});
+	}
+
+	private async resolveSpectatorBinary(engineDir: string): Promise<string> {
+		const headlessPath = path.join(engineDir, engineHeadlessBinaryName());
+		if (await fs.stat(headlessPath).catch(() => null)) {
+			return headlessPath;
+		}
+
+		return path.join(engineDir, engineClientBinaryName());
+	}
+
+	private async ensureGameContent(engineDir: string, gameName: string): Promise<void> {
+		if (!gameName.includes(':')) {
+			return;
+		}
+
+		const prDownloaderPath = path.join(
+			engineDir,
+			process.platform === 'win32' ? 'pr-downloader.exe' : 'pr-downloader',
+		);
+		if (!(await fs.stat(prDownloaderPath).catch(() => null))) {
+			this.logger.warn({ prDownloaderPath }, 'pr-downloader not found, skipping game download');
+			return;
+		}
+
+		const maxAttempts = Math.max(1, this.env.config.engineDownloadMaxAttempts ?? 2);
+		const backoffBaseMs = Math.max(1, this.env.config.engineDownloadRetryBackoffBaseMs ?? 1000);
+		const timeoutMs = Math.max(5000, (this.env.config.engineInstallTimeoutSeconds ?? 600) * 1000);
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				await this.runPrDownloader(prDownloaderPath, gameName, timeoutMs);
+				return;
+			} catch (err) {
+				if (attempt === maxAttempts) {
+					throw err;
+				}
+				const backoffMs = backoffBaseMs * Math.pow(2, attempt - 1);
+				this.logger.warn(
+					{ err, gameName, attempt, maxAttempts, backoffMs },
+					'game download failed, retrying',
+				);
+				await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+			}
+		}
+	}
+
+	private async runPrDownloader(
+		prDownloaderPath: string,
+		gameName: string,
+		timeoutMs: number,
+	): Promise<void> {
+		const searchUrl = new URL(
+			'/find',
+			this.env.config.engineCdnBaseUrl ?? 'https://files-cdn.beyondallreason.dev',
+		).toString();
+		const repoMasterUrl =
+			this.env.config.rapidRepoMasterUrl ?? 'https://repos-cdn.beyondallreason.dev/repos.gz';
+
+		try {
+			await this.runPrDownloaderOnce(prDownloaderPath, gameName, timeoutMs, repoMasterUrl, searchUrl);
+		} catch (err) {
+			if (!isTlsCertError(err)) {
+				throw err;
+			}
+
+			const insecureRepoMasterUrl = forceHttpUrl(repoMasterUrl);
+			const insecureSearchUrl = forceHttpUrl(searchUrl);
+			if (!insecureRepoMasterUrl || !insecureSearchUrl) {
+				throw err;
+			}
+
+			this.logger.warn(
+				{ repoMasterUrl, searchUrl },
+				'pr-downloader TLS CA error detected, retrying game download over HTTP',
+			);
+			await this.runPrDownloaderOnce(
+				prDownloaderPath,
+				gameName,
+				timeoutMs,
+				insecureRepoMasterUrl,
+				insecureSearchUrl,
+			);
+		}
+	}
+
+	private async runPrDownloaderOnce(
+		prDownloaderPath: string,
+		gameName: string,
+		timeoutMs: number,
+		repoMasterUrl: string,
+		searchUrl: string,
+	): Promise<void> {
+		await new Promise<void>((resolve, reject) => {
+			const args = ['--filesystem-writepath', path.resolve('.'), '--download-game', gameName];
+			const pr = (this.env.mocks?.spawn ?? spawn)(prDownloaderPath, args, {
+				env: {
+					...process.env,
+					// Point bundled libcurl at the system CA bundle so HTTPS works
+					// in minimal container images (e.g. bookworm-slim).
+
+					PRD_RAPID_USE_STREAMER: 'false',
+					PRD_RAPID_REPO_MASTER: repoMasterUrl,
+					PRD_HTTP_SEARCH_URL: searchUrl,
+				},
+				stdio: ['ignore', 'ignore', 'pipe'],
+			});
+
+			let stderr = '';
+			pr.stderr?.on('data', (data: Buffer) => {
+				stderr += data.toString();
+			});
+
+			const timeout = setTimeout(() => {
+				pr.kill('SIGKILL');
+				reject(new Error(`pr-downloader timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
+
+			pr.on('error', (err) => {
+				clearTimeout(timeout);
+				reject(err);
+			});
+
+			pr.on('exit', (code, signal) => {
+				clearTimeout(timeout);
+				if (code === 0) {
+					resolve();
+					return;
+				}
+				reject(
+					new Error(
+						`pr-downloader exited with code ${code}, signal ${signal}${stderr ? `: ${stderr.trim()}` : ''}`,
+					),
+				);
+			});
+		});
 	}
 
 	private async startEngine(
@@ -376,6 +627,33 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 
 		return instanceDir;
 	}
+}
+
+function forceHttpUrl(url: string): string | null {
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== 'https:') {
+			return null;
+		}
+		parsed.protocol = 'http:';
+		return parsed.toString();
+	} catch {
+		return null;
+	}
+}
+
+function isTlsCertError(err: unknown): boolean {
+	if (!(err instanceof Error)) {
+		return false;
+	}
+	const msg = err.message.toLowerCase();
+	return (
+		msg.includes('ssl ca cert') ||
+		msg.includes('ssl peer certificate') ||
+		msg.includes('certificate verify failed') ||
+		msg.includes('curl error(1:77)') ||
+		msg.includes('curl error(1:60)')
+	);
 }
 
 /**

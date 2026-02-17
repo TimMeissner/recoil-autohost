@@ -80,6 +80,30 @@ function createStartRequest(players: { name: string; userId: string }[]): Autoho
 	};
 }
 
+function createBotOnlyStartRequest(): AutohostStartRequestData {
+	return {
+		battleId: randomUUID(),
+		engineVersion: 'test',
+		mapName: 'map v1',
+		gameName: 'mod v1',
+		startPosType: 'fixed',
+		allyTeams: [
+			{
+				teams: [
+					{
+						bots: [
+							{
+								hostUserId: 'replace-me',
+								aiShortName: 'BARb',
+							},
+						],
+					},
+				],
+			},
+		],
+	};
+}
+
 test('getPlayerNumbers match statscript gen', () => {
 	const req = createStartRequest([{ name: 'Asd', userId: '0000-1' }]);
 	req.spectators = [
@@ -164,6 +188,63 @@ suite('Autohost', async () => {
 		const ah = new Autohost(env, gm, new EngineVersionsManagerFake());
 		const res = await ah.start(createStartRequest([{ name: 'user1', userId: randomUUID() }]));
 		assert.ok(res.ips.length > 0);
+	});
+
+	await test('bot-only start adds autohost spectator and spectator sidecar', async () => {
+		const capturedOpts: Parameters<typeof runEngine>[1][] = [];
+		const env = getEnv((optsEnv, opts) => {
+			capturedOpts.push(opts);
+			return fakeRunEngine(optsEnv, opts);
+		});
+		const gm = new GamesManager(env);
+		const ah = new Autohost(env, gm, new EngineVersionsManagerFake());
+
+		const req = createBotOnlyStartRequest();
+		await ah.start(req);
+
+		assert.equal(capturedOpts.length, 1);
+		const opts = capturedOpts[0];
+		assert.ok(opts.spectatorClient);
+		assert.equal(opts.startRequest.spectators?.length, 1);
+		assert.ok(opts.startRequest.spectators?.[0].userId);
+		assert.ok(opts.startRequest.spectators?.[0].password);
+		assert.equal(opts.startRequest.spectators?.[0].name, opts.spectatorClient!.name);
+		assert.equal(opts.startRequest.spectators?.[0].password, opts.spectatorClient!.password);
+		assert.equal(
+			opts.startRequest.allyTeams[0].teams[0].bots?.[0].hostUserId,
+			opts.startRequest.spectators?.[0].userId,
+		);
+	});
+
+	await test('bot-only start reuses existing spectator instead of adding another', async () => {
+		const capturedOpts: Parameters<typeof runEngine>[1][] = [];
+		const env = getEnv((optsEnv, opts) => {
+			capturedOpts.push(opts);
+			return fakeRunEngine(optsEnv, opts);
+		});
+		const gm = new GamesManager(env);
+		const ah = new Autohost(env, gm, new EngineVersionsManagerFake());
+
+		const req = createBotOnlyStartRequest();
+		req.allyTeams[0].teams[0].bots![0].hostUserId = 'host-user-id';
+		req.spectators = [
+			{
+				userId: 'host-user-id',
+				name: 'Autohost Bot Host',
+				password: 'known-pass',
+				countryCode: 'US',
+			},
+		];
+
+		await ah.start(req);
+
+		assert.equal(capturedOpts.length, 1);
+		const opts = capturedOpts[0];
+		assert.equal(opts.startRequest.spectators?.length, 1);
+		assert.equal(opts.startRequest.spectators?.[0].userId, 'host-user-id');
+		assert.equal(opts.startRequest.spectators?.[0].name, 'Autohost_Bot_Host');
+		assert.equal(opts.spectatorClient?.name, 'Autohost_Bot_Host');
+		assert.equal(opts.spectatorClient?.password, 'known-pass');
 	});
 
 	await test('multiple starts', async () => {

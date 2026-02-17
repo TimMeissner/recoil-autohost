@@ -6,11 +6,11 @@ import test, { suite } from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 import events from 'node:events';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AutohostStartRequestData } from 'tachyon-protocol/types';
-import { setImmediate as asyncSetImmediate } from 'timers/promises';
+import { setImmediate as asyncSetImmediate, setTimeout as asyncSetTimeout } from 'timers/promises';
 
 import { runEngine, EngineRunnerImpl } from './engineRunner.js';
 import { chdir } from 'node:process';
@@ -70,14 +70,14 @@ let testDir: string;
 
 suite('engineRunner', () => {
 	test.beforeEach(async () => {
-		testDir = await mkdtemp(join(tmpdir(), 'engine-runner-test-'));
+		testDir = await mkdtemp(path.join(tmpdir(), 'engine-runner-test-'));
 		chdir(testDir);
 		await mkdir('engines/test', { recursive: true });
 	});
 
 	test.afterEach(async () => {
 		chdir(origCwd);
-		await rm(testDir, { recursive: true });
+		await rm(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
 	test('runEngine quick close works', async () => {
@@ -246,5 +246,234 @@ suite('engineRunner', () => {
 			Buffer.from('id:xn'),
 			Buffer.from('69643affff', 'hex'),
 		]);
+	});
+
+	test('spawns spectator sidecar for bot-only load mode', async () => {
+		const hostCp = new ChildProcess();
+		const spectatorCp = new ChildProcess();
+		spectatorCp.kill = (() => {
+			process.nextTick(() => spectatorCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+		hostCp.kill = (() => {
+			process.nextTick(() => hostCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+
+		const spawnCalls: Array<{ cmd: string; args: string[]; opts: SpawnOptions }> = [];
+		const er = new EngineRunnerImpl(
+			getEnv(((cmd: string, args: string[], opts: SpawnOptions) => {
+				spawnCalls.push({ cmd, args, opts });
+				if (spawnCalls.length === 1) {
+					process.nextTick(() => hostCp.emit('spawn'));
+					return hostCp;
+				}
+				process.nextTick(() => spectatorCp.emit('spawn'));
+				return spectatorCp;
+			}) as typeof spawn),
+		);
+
+		er._run({
+			...optsBase,
+			spectatorClient: {
+				hostIP: '127.0.0.1',
+				name: 'autohost-bot-spectator',
+				password: 'test-pass',
+			},
+		});
+
+		const s = dgram.createSocket('udp4');
+		try {
+			s.connect(testPort);
+			await events.once(s, 'connect');
+			const serverStartedPacket = Buffer.from('00', 'hex');
+			const sender = setInterval(() => {
+				s.send(serverStartedPacket);
+			}, 5);
+			await events.once(er, 'start');
+			clearInterval(sender);
+
+			for (let i = 0; i < 50 && spawnCalls.length < 2; i++) {
+				await asyncSetTimeout(10);
+			}
+
+			assert.equal(spawnCalls.length, 2);
+			const sidecarScriptPath = spawnCalls[1].args[0];
+			assert.match(sidecarScriptPath, /[\\/]instances[\\/].*[\\/]spectator[\\/]script\.txt$/);
+			const sidecarScript = await readFile(sidecarScriptPath, 'utf-8');
+			assert.match(sidecarScript, /\bIsHost\s*=\s*0\b/);
+			assert.match(sidecarScript, /\bGameType\s*=\s*mod v1\b/);
+			assert.match(sidecarScript, /\bMyPlayerName\s*=\s*autohost-bot-spectator\b/);
+			assert.match(sidecarScript, /\bMyPasswd\s*=\s*test-pass\b/);
+		} finally {
+			er.close();
+			await events.once(er, 'exit');
+			s.close();
+		}
+	});
+
+	test('downloads rapid game content before spectator spawn', async () => {
+		const prDownloaderName = process.platform === 'win32' ? 'pr-downloader.exe' : 'pr-downloader';
+		await writeFile(path.join(testDir, 'engines', 'test', prDownloaderName), 'fake-binary');
+
+		const hostCp = new ChildProcess();
+		const prDownloaderCp = new ChildProcess();
+		const spectatorCp = new ChildProcess();
+		spectatorCp.kill = (() => {
+			process.nextTick(() => spectatorCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+		hostCp.kill = (() => {
+			process.nextTick(() => hostCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+
+		const spawnCalls: Array<{ cmd: string; args: string[]; opts: SpawnOptions }> = [];
+		const er = new EngineRunnerImpl(
+			getEnv(((cmd: string, args: string[], opts: SpawnOptions) => {
+				spawnCalls.push({ cmd, args, opts });
+				const cmdName = path.basename(cmd);
+				if (cmdName === prDownloaderName) {
+					process.nextTick(() => {
+						prDownloaderCp.emit('spawn');
+						prDownloaderCp.emit('exit', 0, null);
+					});
+					return prDownloaderCp;
+				}
+				if (spawnCalls.length === 1) {
+					process.nextTick(() => hostCp.emit('spawn'));
+					return hostCp;
+				}
+				process.nextTick(() => spectatorCp.emit('spawn'));
+				return spectatorCp;
+			}) as typeof spawn),
+		);
+
+		er._run({
+			...optsBase,
+			startRequest: {
+				...optsBase.startRequest,
+				gameName: 'byar:test',
+			},
+			spectatorClient: {
+				hostIP: '127.0.0.1',
+				name: 'autohost-bot-spectator',
+				password: 'test-pass',
+			},
+		});
+
+		const s = dgram.createSocket('udp4');
+		try {
+			s.connect(testPort);
+			await events.once(s, 'connect');
+			const serverStartedPacket = Buffer.from('00', 'hex');
+			const sender = setInterval(() => {
+				s.send(serverStartedPacket);
+			}, 5);
+			await events.once(er, 'start');
+			clearInterval(sender);
+
+			for (let i = 0; i < 50 && spawnCalls.length < 3; i++) {
+				await asyncSetTimeout(10);
+			}
+
+			assert.equal(spawnCalls.length, 3);
+			assert.match(spawnCalls[1].cmd, new RegExp(`${prDownloaderName.replace('.', '\\.')}$`));
+			assert.deepEqual(spawnCalls[1].args, [
+				'--filesystem-writepath',
+				testDir,
+				'--download-game',
+				'byar:test',
+			]);
+		} finally {
+			er.close();
+			await events.once(er, 'exit');
+			s.close();
+		}
+	});
+
+	test('falls back to http on pr-downloader TLS cert errors', async () => {
+		const prDownloaderName = process.platform === 'win32' ? 'pr-downloader.exe' : 'pr-downloader';
+		await writeFile(path.join(testDir, 'engines', 'test', prDownloaderName), 'fake-binary');
+
+		const hostCp = new ChildProcess();
+		const prDownloaderCp1 = new ChildProcess();
+		const prDownloaderCp2 = new ChildProcess();
+		const spectatorCp = new ChildProcess();
+		spectatorCp.kill = (() => {
+			process.nextTick(() => spectatorCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+		hostCp.kill = (() => {
+			process.nextTick(() => hostCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+
+		const spawnCalls: Array<{ cmd: string; args: string[]; opts: SpawnOptions }> = [];
+		const er = new EngineRunnerImpl(
+			getEnv(((cmd: string, args: string[], opts: SpawnOptions) => {
+				spawnCalls.push({ cmd, args, opts });
+				const cmdName = path.basename(cmd);
+				if (cmdName === prDownloaderName) {
+					if (spawnCalls.length === 2) {
+						process.nextTick(() => {
+							prDownloaderCp1.emit(
+								'error',
+								new Error('CURL error(1:77): Problem with the SSL CA cert'),
+							);
+						});
+						return prDownloaderCp1;
+					}
+					process.nextTick(() => {
+						prDownloaderCp2.emit('spawn');
+						prDownloaderCp2.emit('exit', 0, null);
+					});
+					return prDownloaderCp2;
+				}
+				if (spawnCalls.length === 1) {
+					process.nextTick(() => hostCp.emit('spawn'));
+					return hostCp;
+				}
+				process.nextTick(() => spectatorCp.emit('spawn'));
+				return spectatorCp;
+			}) as typeof spawn),
+		);
+
+		er._run({
+			...optsBase,
+			startRequest: {
+				...optsBase.startRequest,
+				gameName: 'byar:test',
+			},
+			spectatorClient: {
+				hostIP: '127.0.0.1',
+				name: 'autohost-bot-spectator',
+				password: 'test-pass',
+			},
+		});
+
+		const s = dgram.createSocket('udp4');
+		try {
+			s.connect(testPort);
+			await events.once(s, 'connect');
+			const serverStartedPacket = Buffer.from('00', 'hex');
+			const sender = setInterval(() => {
+				s.send(serverStartedPacket);
+			}, 5);
+			await events.once(er, 'start');
+			clearInterval(sender);
+
+			for (let i = 0; i < 50 && spawnCalls.length < 4; i++) {
+				await asyncSetTimeout(10);
+			}
+
+			assert.equal(spawnCalls.length, 4);
+			assert.equal(spawnCalls[1].opts.env?.PRD_RAPID_REPO_MASTER, 'https://repos-cdn.beyondallreason.dev/repos.gz');
+			assert.equal(spawnCalls[2].opts.env?.PRD_RAPID_REPO_MASTER, 'http://repos-cdn.beyondallreason.dev/repos.gz');
+		} finally {
+			er.close();
+			await events.once(er, 'exit');
+			s.close();
+		}
 	});
 });

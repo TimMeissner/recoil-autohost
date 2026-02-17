@@ -51,6 +51,11 @@ interface Config {
 	maxGameDurationSeconds: number;
 }
 
+export interface SpectatorClientOpts {
+	name: string;
+	password: string;
+}
+
 interface Mocks {
 	runEngine?: typeof runEngine;
 }
@@ -89,7 +94,10 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 		throw new TachyonError('internal_error', 'no free port offsets');
 	}
 
-	async start(req: AutohostStartRequestData): Promise<{ ip: string; port: number }> {
+	async start(
+		req: AutohostStartRequestData,
+		spectatorClient?: SpectatorClientOpts,
+	): Promise<{ ip: string; port: number }> {
 		if (this.usedBattleIds.has(req.battleId)) {
 			throw new TachyonError<'autohost/start'>(
 				'battle_already_exists',
@@ -107,6 +115,15 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 			hostIP: this.env.config.engineBindIP,
 			hostPort: this.env.config.engineStartPort + portOffset,
 			autohostPort: this.env.config.engineAutohostStartPort + portOffset,
+			spectatorClient: spectatorClient
+				? {
+					...spectatorClient,
+					hostIP:
+						this.env.config.engineBindIP === '0.0.0.0'
+							? '127.0.0.1'
+							: this.env.config.engineBindIP,
+				}
+				: undefined,
 		});
 		const game: Game = {
 			battleId: req.battleId,

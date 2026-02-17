@@ -1,8 +1,11 @@
 {
-  "tachyonServer": "localhost",
-  "tachyonServerPort": 8084,
-  "authClientId": "autohost1",
-  "authClientSecret": "pass1",
+  "tachyonServer": "192.168.178.166",
+  "useSecureConnection": "false",
+  "tachyonServerPort": 5174,
+  "authClientId": "recoil-autohost",
+  "engineDownloadMaxAttempts": 10,
+  "engineDownloadRetryBackoffBaseMs": 1000,
+  "authClientSecret": "recoil-autohost-dev-secret",
   "hostingIP": "127.0.0.1",
   "engineBindIP": "0.0.0.0",
   "engineSettings": {
