@@ -67,15 +67,11 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 	private usedPortOffset: Set<number> = new Set();
 	private lastPortOffset: number = 0;
 	private logger: Env['logger'];
-	private currCapacity: GamesCapacity;
+	private currentBattles: number = 0;
 
 	constructor(private env: Env) {
 		super();
 		this.logger = env.logger.child({ class: 'GamesManager' });
-		this.currCapacity = {
-			currentBattles: 0,
-			maxBattles: env.config.maxBattles,
-		};
 	}
 
 	private findFreePortOffset(): number {
@@ -133,7 +129,7 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 			this.usedPortOffset.delete(game.portOffset);
 			if (game.started) {
 				this.emit('exit', game.battleId);
-				this.currCapacity.currentBattles -= 1;
+				this.currentBattles -= 1;
 				this.emit('capacity', this.capacity);
 			}
 		});
@@ -148,7 +144,7 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 		await events.once(er, 'start');
 		game.started = true;
 		game.killTimer = this.createKillTimer(game);
-		this.currCapacity.currentBattles += 1;
+		this.currentBattles += 1;
 		process.nextTick(() => {
 			this.emit('capacity', this.capacity);
 		});
@@ -184,6 +180,9 @@ export class GamesManager extends TypedEmitter<Events> implements GamesManager {
 	}
 
 	get capacity(): GamesCapacity {
-		return { ...this.currCapacity };
+		return {
+			currentBattles: this.currentBattles,
+			maxBattles: this.env.config.maxBattles,
+		};
 	}
 }

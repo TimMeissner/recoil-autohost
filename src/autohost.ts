@@ -104,7 +104,7 @@ export class Autohost implements TachyonAutohost {
 	) {
 		this.logger = env.logger;
 		this.eventsBuffer = new EventsBuffer(
-			env.config.maxUpdatesSubscriptionAgeSeconds * 1000 * 1000,
+			() => env.config.maxUpdatesSubscriptionAgeSeconds * 1000 * 1000,
 		);
 
 		this.currentStatus = {
@@ -281,12 +281,17 @@ export class Autohost implements TachyonAutohost {
 
 	connected(server: TachyonServer): void {
 		this.server = server;
-		server.status(this.currentStatus).catch(() => null);
+		this.refreshStatus();
 	}
 
 	disconnected(): void {
 		this.server = undefined;
 		this.eventsBuffer.unsubscribe();
+	}
+
+	refreshStatus(): void {
+		this.currentStatus = { ...this.currentStatus, ...this.gamesMgr.capacity };
+		if (this.server) this.server.status(this.currentStatus).catch(() => null);
 	}
 
 	private getPlayerName(battleId: string, userId: string): string {

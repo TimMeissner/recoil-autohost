@@ -65,6 +65,8 @@ export class EventsBuffer<T> {
 	private pusherEventsIdx: number = 0;
 	private lastDropTime: number = 0;
 	private events: Deque<{ time: number; event: T }> = new Deque();
+	private getMaxAge: () => number;
+	private getDroppingFrequency: () => number;
 
 	/**
 	 * Construct new EventsBuffer.
@@ -76,9 +78,16 @@ export class EventsBuffer<T> {
 	 *     of removing old elements.
 	 */
 	constructor(
-		private maxAge: number,
-		private droppingFrequency: number = (maxAge / 10) | 0,
-	) {}
+		maxAge: number | (() => number),
+		droppingFrequency?: number,
+	) {
+		this.getMaxAge = typeof maxAge === 'number' ? () => maxAge : maxAge;
+		if (droppingFrequency === undefined) {
+			this.getDroppingFrequency = () => (this.getMaxAge() / 10) | 0;
+		} else {
+			this.getDroppingFrequency = () => droppingFrequency;
+		}
+	}
 
 	/**
 	 * Subscribe to event updates since specified time.
@@ -95,10 +104,11 @@ export class EventsBuffer<T> {
 				'callback already set, unsubscribe first',
 			);
 		}
-		if (since < Date.now() * 1000 - this.maxAge) {
+		const maxAge = this.getMaxAge();
+		if (since < Date.now() * 1000 - maxAge) {
 			throw new EventsBufferError(
 				'too_far_in_the_past',
-				`since is too far in the past, max age is ${(this.maxAge / (1000 * 1000)) | 0}s`,
+				`since is too far in the past, max age is ${(maxAge / (1000 * 1000)) | 0}s`,
 			);
 		}
 
@@ -134,7 +144,7 @@ export class EventsBuffer<T> {
 		this.events.pushFront({ time, event });
 		this.pusherEventsIdx += 1; // Because pusher worker moves from back to front.
 		this.startPusher(0);
-		this.maybeDropOlderThen(time - this.maxAge);
+		this.maybeDropOlderThen(time - this.getMaxAge());
 	}
 
 	/**
@@ -147,7 +157,7 @@ export class EventsBuffer<T> {
 	}
 
 	private maybeDropOlderThen(after: number) {
-		if (after > this.lastDropTime + this.droppingFrequency) {
+		if (after > this.lastDropTime + this.getDroppingFrequency()) {
 			let pos =
 				binarySearch(
 					0,

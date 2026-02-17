@@ -3,8 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { Ajv, JSONSchemaType, type Plugin } from 'ajv';
 import ajvFormats, { type FormatsPluginOptions } from 'ajv-formats';
+import { FSWatcher } from 'chokidar';
+import type { Logger } from 'pino';
+import { TypedEmitter } from 'tiny-typed-emitter';
 // https://github.com/ajv-validator/ajv-formats/issues/85#issuecomment-2377962689
 const addFormats = ajvFormats as unknown as Plugin<FormatsPluginOptions>;
 
@@ -162,4 +166,124 @@ export async function loadConfig(path: string): Promise<Config> {
 		});
 	}
 	return config;
+}
+
+type ConfigField = keyof Config;
+
+type ConnectionConfigField =
+	| 'tachyonServer'
+	| 'tachyonServerPort'
+	| 'useSecureConnection'
+	| 'authClientId'
+	| 'authClientSecret';
+type DangerousConfigField = 'engineStartPort' | 'engineAutohostStartPort';
+
+const connectionFields = new Set<ConfigField>([
+	'tachyonServer',
+	'tachyonServerPort',
+	'useSecureConnection',
+	'authClientId',
+	'authClientSecret',
+]);
+const dangerousFields = new Set<ConfigField>(['engineStartPort', 'engineAutohostStartPort']);
+
+export interface ConfigManagerEvents {
+	reloaded: (changedFields: ConfigField[]) => void;
+	connectionConfigChanged: (changedFields: ConnectionConfigField[]) => void;
+}
+
+export class ConfigManager extends TypedEmitter<ConfigManagerEvents> {
+	private watcher: FSWatcher;
+	private pendingReload: Promise<void> = Promise.resolve();
+
+	private constructor(
+		private logger: Logger,
+		private configPath: string,
+		public config: Config,
+	) {
+		super();
+		this.watcher = new FSWatcher({
+			awaitWriteFinish: {
+				pollInterval: 100,
+				stabilityThreshold: 300,
+			},
+		});
+
+		this.watcher.on('add', () => this.queueReload());
+		this.watcher.on('change', () => this.queueReload());
+		this.watcher.on('error', (error: unknown) => {
+			if (error instanceof Error) {
+				this.logger.error(error, 'config watcher error');
+			} else {
+				this.logger.error({ error }, 'unknown config watcher error');
+			}
+		});
+		this.watcher.add(this.configPath);
+	}
+
+	public static async create(logger: Logger, configPath: string): Promise<ConfigManager> {
+		const config = await loadConfig(configPath);
+		return new ConfigManager(logger, configPath, config);
+	}
+
+	public close(): Promise<void> {
+		return this.watcher.close();
+	}
+
+	private queueReload() {
+		this.pendingReload = this.pendingReload
+			.then(async () => this.reload())
+			.catch((error: unknown) => {
+				if (error instanceof Error) {
+					this.logger.error(error, 'config reload failed');
+				} else {
+					this.logger.error({ error }, 'config reload failed');
+				}
+			});
+	}
+
+	private async reload() {
+		let nextConfig: Config;
+		try {
+			nextConfig = await loadConfig(this.configPath);
+		} catch (error) {
+			this.logger.error(error, 'failed to reload config, keeping previous config');
+			return;
+		}
+
+		const changedFields = getChangedConfigFields(this.config, nextConfig);
+		if (changedFields.length === 0) {
+			return;
+		}
+
+		Object.assign(this.config, nextConfig);
+		this.logger.info({ changedFields }, 'reloaded config');
+		this.emit('reloaded', changedFields);
+
+		const changedConnectionFields = changedFields.filter((field): field is ConnectionConfigField =>
+			connectionFields.has(field),
+		);
+		if (changedConnectionFields.length > 0) {
+			this.logger.info(
+				{ changedConnectionFields },
+				'connection config changed, reconnect required',
+			);
+			this.emit('connectionConfigChanged', changedConnectionFields);
+		}
+
+		const changedDangerousFields = changedFields.filter((field): field is DangerousConfigField =>
+			dangerousFields.has(field),
+		);
+		if (changedDangerousFields.length > 0) {
+			this.logger.warn(
+				{ changedDangerousFields },
+				'engine port range settings changed; only future games use new values',
+			);
+		}
+	}
+}
+
+function getChangedConfigFields(current: Config, next: Config): ConfigField[] {
+	const keys = Object.keys(next) as ConfigField[];
+	return keys.filter((key) => !isDeepStrictEqual(current[key], next[key]));
 }
