@@ -80,6 +80,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           import re
           import urllib.request
 
@@ -99,7 +100,7 @@ jobs:
             url = payload.get("next")
 
           next_tag = max_tag + 1
-          with open("$GITHUB_OUTPUT", "a", encoding="utf-8") as output:
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"value={next_tag}\n")
           PY
 
