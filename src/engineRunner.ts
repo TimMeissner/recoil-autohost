@@ -266,6 +266,15 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 		}
 	}
 
+	private async writePidFile(dir: string, pid: number | undefined, processName: string): Promise<void> {
+		if (pid === undefined) {
+			this.logger.warn({ processName }, 'process spawned without pid, skipping pid file');
+			return;
+		}
+
+		await fs.writeFile(path.join(dir, 'pid.txt'), `${pid}\n`);
+	}
+
 	private handleError(err: Error): void {
 		if (this.state >= State.Stopping) return;
 		this.emit('error', err);
@@ -310,6 +319,10 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 					`Received packet from ${rinfo.port}, blocked`,
 				);
 				return;
+			}
+
+			if (packet.type === EventType.SERVER_GAMEOVER) {
+				this.killSpectator();
 			}
 
 			// Don't emit luamsg's not matching start script regexp.
@@ -374,6 +387,9 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 
 		this.spectatorProcess.on('spawn', () => {
 			this.spectatorSpawned = true;
+			this.writePidFile(spectatorDir, this.spectatorProcess?.pid, 'spectator').catch((err) => {
+				this.logger.warn(err, 'failed to write spectator pid file');
+			});
 			if (this.state == State.Stopping) {
 				this.killSpectator();
 			}
@@ -570,6 +586,9 @@ export class EngineRunnerImpl extends TypedEmitter<EngineRunnerEvents> implement
 		});
 		this.engineProcess.on('spawn', () => {
 			this.engineSpawned = true;
+			this.writePidFile(instanceDir, this.engineProcess?.pid, 'engine').catch((err) => {
+				this.logger.warn(err, 'failed to write engine pid file');
+			});
 			if (this.state == State.Stopping) {
 				this.killEngine();
 			}

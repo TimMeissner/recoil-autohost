@@ -251,6 +251,8 @@ suite('engineRunner', () => {
 	test('spawns spectator sidecar for bot-only load mode', async () => {
 		const hostCp = new ChildProcess();
 		const spectatorCp = new ChildProcess();
+		Object.defineProperty(hostCp, 'pid', { value: 1111, configurable: true });
+		Object.defineProperty(spectatorCp, 'pid', { value: 2222, configurable: true });
 		spectatorCp.kill = (() => {
 			process.nextTick(() => spectatorCp.emit('exit', 0, 'SIGTERM'));
 			return true;
@@ -305,6 +307,74 @@ suite('engineRunner', () => {
 			assert.match(sidecarScript, /\bGameType\s*=\s*mod v1\b/);
 			assert.match(sidecarScript, /\bMyPlayerName\s*=\s*autohost-bot-spectator\b/);
 			assert.match(sidecarScript, /\bMyPasswd\s*=\s*test-pass\b/);
+
+			const enginePid = await readFile(path.join(testDir, 'instances', demoStartRequest.battleId, 'pid.txt'), 'utf-8');
+			assert.equal(enginePid.trim(), '1111');
+			const spectatorPid = await readFile(path.join(testDir, 'instances', demoStartRequest.battleId, 'spectator', 'pid.txt'), 'utf-8');
+			assert.equal(spectatorPid.trim(), '2222');
+		} finally {
+			er.close();
+			await events.once(er, 'exit');
+			s.close();
+		}
+	});
+
+	test('closes spectator when battle ends', async () => {
+		const hostCp = new ChildProcess();
+		const spectatorCp = new ChildProcess();
+		let spectatorKillCalls = 0;
+		spectatorCp.kill = (() => {
+			spectatorKillCalls += 1;
+			process.nextTick(() => spectatorCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+		hostCp.kill = (() => {
+			process.nextTick(() => hostCp.emit('exit', 0, 'SIGTERM'));
+			return true;
+		}) as typeof ChildProcess.prototype.kill;
+
+		let spawnCount = 0;
+		const er = new EngineRunnerImpl(
+			getEnv((() => {
+				spawnCount += 1;
+				if (spawnCount === 1) {
+					process.nextTick(() => hostCp.emit('spawn'));
+					return hostCp;
+				}
+				process.nextTick(() => spectatorCp.emit('spawn'));
+				return spectatorCp;
+			}) as typeof spawn),
+		);
+
+		er._run({
+			...optsBase,
+			spectatorClient: {
+				hostIP: '127.0.0.1',
+				name: 'autohost-bot-spectator',
+				password: 'test-pass',
+			},
+		});
+
+		const s = dgram.createSocket('udp4');
+		try {
+			s.connect(testPort);
+			await events.once(s, 'connect');
+			const serverStartedPacket = Buffer.from('00', 'hex');
+			const sender = setInterval(() => {
+				s.send(serverStartedPacket);
+			}, 5);
+			await events.once(er, 'start');
+			clearInterval(sender);
+			for (let i = 0; i < 50 && spawnCount < 2; i++) {
+				await asyncSetTimeout(10);
+			}
+
+			s.send(Buffer.from([EventType.SERVER_GAMEOVER, 3, 0]));
+			for (let i = 0; i < 50 && spectatorKillCalls < 1; i++) {
+				await asyncSetTimeout(10);
+			}
+
+			assert.equal(spectatorKillCalls, 1);
 		} finally {
 			er.close();
 			await events.once(er, 'exit');
