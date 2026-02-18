@@ -3,141 +3,193 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from 'node:fs/promises';
-import { Ajv, JSONSchemaType, type Plugin } from 'ajv';
-import ajvFormats, { type FormatsPluginOptions } from 'ajv-formats';
-// https://github.com/ajv-validator/ajv-formats/issues/85#issuecomment-2377962689
-const addFormats = ajvFormats as unknown as Plugin<FormatsPluginOptions>;
+import { z } from 'zod';
+import dotenv from 'dotenv';
 
-export interface Config {
-	tachyonServer: string;
-	tachyonServerPort: number | null;
-	useSecureConnection: boolean | null;
-	authClientId: string;
-	authClientSecret: string;
-	hostingIP: string;
-	engineBindIP: string;
-	maxReconnectDelaySeconds: number;
-	engineSettings: { [k: string]: string };
-	maxBattles: number;
-	maxUpdatesSubscriptionAgeSeconds: number;
-	engineStartPort: number;
-	engineAutohostStartPort: number;
-	maxPortsUsed: number;
-	engineInstallTimeoutSeconds: number;
-	maxGameDurationSeconds: number;
-}
+const ipv4Regex =
+	/^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 
-const ConfigSchema: JSONSchemaType<Config> = {
-	$id: 'Config',
-	type: 'object',
-	properties: {
-		tachyonServer: {
-			type: 'string',
-			description: 'Hostname of the tachyon server to connect to.',
-		},
-		tachyonServerPort: {
-			type: 'number',
-			description:
-				'Optional port of the tachyon server, by default standard HTTPS port will be used.',
-		},
-		useSecureConnection: {
-			type: 'boolean',
-			description:
-				'Whatever to use HTTPS/WSS to connect to tachyon server. Defaults to true, except for localhost.',
-		},
-		authClientId: {
-			type: 'string',
-			description: 'OAuth2 client id for authentication.',
-		},
-		authClientSecret: {
-			type: 'string',
-			description: 'OAuth2 client secret for authentication',
-		},
-		hostingIP: {
-			type: 'string',
-			description: 'The IP advertised to clients for connecting to the battle.',
-			format: 'ipv4',
-		},
-		engineBindIP: {
-			type: 'string',
-			description: 'The local IP/interface used by engine to bind the battle socket.',
-			default: '0.0.0.0',
-			format: 'ipv4',
-		},
-		maxReconnectDelaySeconds: {
-			type: 'number',
-			description: 'Maximum delay for reconnects to tachyon server.',
-			default: 30,
-			minimum: 1,
-		},
-		engineSettings: {
-			type: 'object',
-			description: 'Engine settings to be serialized into springsettings.cfg',
-			additionalProperties: { type: 'string' },
-			default: {},
-			required: [],
-		},
-		maxBattles: {
-			type: 'integer',
-			description: 'Maximum number of battler that can be hosted.',
-			default: 50,
-			minimum: 1,
-		},
-		maxUpdatesSubscriptionAgeSeconds: {
-			type: 'number',
-			description:
-				'For how long autohost will keep engine updates. This determines the max time used in subscribeUpdates.',
-			default: 10 * 60,
-		},
-		engineStartPort: {
-			type: 'integer',
-			description: 'Start of the port range used by engine instances.',
-			default: 20000,
-			minimum: 1025,
-			maximum: 65535,
-		},
-		engineAutohostStartPort: {
-			type: 'integer',
-			description:
-				'Start of the port range used by engine for autohost interface on localhost.',
-			default: 22000,
-			minimum: 1025,
-			maximum: 65535,
-		},
-		maxPortsUsed: {
-			type: 'integer',
-			description:
-				'Maximum number of ports that can be used by the service, this +StartPorts define the port range.',
-			default: 1000,
-			minimum: 1,
-		},
-		engineInstallTimeoutSeconds: {
-			type: 'integer',
-			description: 'Hard timeout for engine installation by engine manager',
-			default: 10 * 60,
-			minimum: 5,
-		},
-		maxGameDurationSeconds: {
-			type: 'number',
-			description: 'How many seconds to wait before automatically killing the game.',
-			default: 8 * 60 * 60,
-			minimum: 60 * 60,
-		},
-	},
-	required: ['tachyonServer', 'authClientId', 'authClientSecret', 'hostingIP'],
-	additionalProperties: true,
+const ipv4 = z.string().regex(ipv4Regex, 'Must be a valid IPv4 address');
+
+/**
+ * Zod schema for the full application config.
+ *
+ * Every field with `.default()` is optional in the input; the parser fills in
+ * the default when the key is missing or `undefined`.
+ */
+export const ConfigSchema = z.object({
+	tachyonServer: z.string().describe('Hostname of the tachyon server to connect to.'),
+	tachyonServerPort: z.coerce
+		.number()
+		.nullable()
+		.default(null)
+		.describe(
+			'Optional port of the tachyon server, by default standard HTTPS port will be used.',
+		),
+	useSecureConnection: z
+		.boolean()
+		.nullable()
+		.default(null)
+		.describe(
+			'Whether to use SSL to connect to tachyon server. Defaults to true, except for localhost.',
+		),
+	authClientId: z.string().describe('OAuth2 client id for authentication.'),
+	authClientSecret: z.string().describe('OAuth2 client secret for authentication'),
+	hostingIP: ipv4.describe('The IP advertised to clients for connecting to the battle.'),
+	engineBindIP: ipv4
+		.default('0.0.0.0')
+		.describe('The local IP/interface used by engine to bind the battle socket.'),
+	maxReconnectDelaySeconds: z.coerce
+		.number()
+		.min(1)
+		.default(30)
+		.describe('Maximum delay for reconnects to tachyon server.'),
+	engineSettings: z
+		.record(z.string(), z.string())
+		.default({})
+		.describe('Engine settings to be serialized into springsettings.cfg'),
+	maxBattles: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.default(50)
+		.describe('Maximum number of battles that can be hosted.'),
+	maxUpdatesSubscriptionAgeSeconds: z.coerce
+		.number()
+		.default(10 * 60)
+		.describe(
+			'For how long autohost will keep engine updates. This determines the max time used in subscribeUpdates.',
+		),
+	engineStartPort: z.coerce
+		.number()
+		.int()
+		.min(1025)
+		.max(65535)
+		.default(20000)
+		.describe('Start of the port range used by engine instances.'),
+	engineAutohostStartPort: z.coerce
+		.number()
+		.int()
+		.min(1025)
+		.max(65535)
+		.default(22000)
+		.describe('Start of the port range used by engine for autohost interface on localhost.'),
+	maxPortsUsed: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.default(1000)
+		.describe(
+			'Maximum number of ports that can be used by the service, this +StartPorts define the port range.',
+		),
+	engineInstallTimeoutSeconds: z.coerce
+		.number()
+		.int()
+		.min(5)
+		.default(10 * 60)
+		.describe('Hard timeout for engine installation by engine manager'),
+	maxGameDurationSeconds: z.coerce
+		.number()
+		.min(60 * 60)
+		.default(8 * 60 * 60)
+		.describe('How many seconds to wait before automatically killing the game.'),
+});
+
+export type Config = z.infer<typeof ConfigSchema>;
+
+/**
+ * Mapping from environment variable names to config keys.
+ *
+ * Only env vars that are explicitly set (i.e. not `undefined`) will be picked
+ * up, so they never accidentally override JSON values with empty strings.
+ */
+const ENV_MAP: Record<string, keyof Config> = {
+	AUTOHOST_TACHYON_SERVER: 'tachyonServer',
+	AUTOHOST_TACHYON_SERVER_PORT: 'tachyonServerPort',
+	AUTOHOST_USE_SECURE_CONNECTION: 'useSecureConnection',
+	AUTOHOST_AUTH_CLIENT_ID: 'authClientId',
+	AUTOHOST_AUTH_CLIENT_SECRET: 'authClientSecret',
+	AUTOHOST_HOSTING_IP: 'hostingIP',
+	AUTOHOST_ENGINE_BIND_IP: 'engineBindIP',
+	AUTOHOST_MAX_RECONNECT_DELAY_SECONDS: 'maxReconnectDelaySeconds',
+	AUTOHOST_ENGINE_SETTINGS: 'engineSettings',
+	AUTOHOST_MAX_BATTLES: 'maxBattles',
+	AUTOHOST_MAX_UPDATES_SUBSCRIPTION_AGE_SECONDS: 'maxUpdatesSubscriptionAgeSeconds',
+	AUTOHOST_ENGINE_START_PORT: 'engineStartPort',
+	AUTOHOST_ENGINE_AUTOHOST_START_PORT: 'engineAutohostStartPort',
+	AUTOHOST_MAX_PORTS_USED: 'maxPortsUsed',
+	AUTOHOST_ENGINE_INSTALL_TIMEOUT_SECONDS: 'engineInstallTimeoutSeconds',
+	AUTOHOST_MAX_GAME_DURATION_SECONDS: 'maxGameDurationSeconds',
 };
 
-const ajv = new Ajv({ strict: true, useDefaults: true, coerceTypes: true });
-addFormats(ajv);
-const validateConfig = ajv.compile(ConfigSchema);
+/**
+ * Read environment variables and return a partial config object.
+ *
+ * - Boolean strings ("true" / "false") are coerced to booleans.
+ * - AUTOHOST_ENGINE_SETTINGS is parsed as a JSON object.
+ * - Numeric coercion is left to Zod (via `z.coerce.number()`).
+ * - Only env vars that are defined are included.
+ */
+function readEnv(env: Record<string, string | undefined>): Record<string, unknown> {
+	const result: Record<string, unknown> = {};
 
-export async function loadConfig(path: string): Promise<Config> {
-	const config = JSON.parse(await fs.readFile(path, 'utf-8'));
-	if (!validateConfig(config)) {
-		throw new Error('Invalid config', {
-			cause: new Error(ajv.errorsText(validateConfig.errors)),
-		});
+	for (const [envKey, configKey] of Object.entries(ENV_MAP)) {
+		const raw = env[envKey];
+		if (raw === undefined) continue;
+
+		if (configKey === 'useSecureConnection') {
+			if (raw.toLowerCase() === 'true') {
+				result[configKey] = true;
+			} else if (raw.toLowerCase() === 'false') {
+				result[configKey] = false;
+			} else {
+				result[configKey] = raw;
+			}
+		} else if (configKey === 'engineSettings') {
+			try {
+				result[configKey] = JSON.parse(raw);
+			} catch {
+				throw new Error(
+					`Invalid JSON in ${envKey}: expected a JSON object like '{"key":"value"}', got: ${raw}`,
+				);
+			}
+		} else {
+			result[configKey] = raw;
+		}
 	}
-	return config;
+
+	return result;
+}
+
+/**
+ * Load, merge, and validate the application config.
+ *
+ * Precedence (highest wins):
+ *   1. Environment variables (real env + `.env` file loaded by dotenv)
+ *   2. JSON config file (if `configPath` is provided)
+ *   3. Schema defaults
+ *
+ * @param configPath  Optional path to a JSON config file.
+ *                    When omitted, config is read entirely from env vars.
+ */
+export async function loadConfig(configPath?: string): Promise<Config> {
+	dotenv.config();
+
+	let fileConfig: Record<string, unknown> = {};
+	if (configPath) {
+		fileConfig = JSON.parse(await fs.readFile(configPath, 'utf-8'));
+	}
+
+	const envConfig = readEnv(process.env);
+	const merged = { ...fileConfig, ...envConfig };
+
+	const result = ConfigSchema.safeParse(merged);
+	if (!result.success) {
+		const formatted = result.error.issues
+			.map((i) => `  ${i.path.join('.')}: ${i.message}`)
+			.join('\n');
+		throw new Error(`Invalid config:\n${formatted}`);
+	}
+
+	return result.data;
 }
