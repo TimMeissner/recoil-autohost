@@ -6,11 +6,6 @@ import fs from 'node:fs/promises';
 import { z } from 'zod';
 import dotenv from 'dotenv';
 
-const ipv4Regex =
-	/^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
-
-const ipv4 = z.string().regex(ipv4Regex, 'Must be a valid IPv4 address');
-
 /**
  * Zod schema for the full application config.
  *
@@ -35,8 +30,8 @@ export const ConfigSchema = z.object({
 		),
 	authClientId: z.string().describe('OAuth2 client id for authentication.'),
 	authClientSecret: z.string().describe('OAuth2 client secret for authentication'),
-	hostingIP: ipv4.describe('The IP advertised to clients for connecting to the battle.'),
-	engineBindIP: ipv4
+	hostingIP: z.ipv4().describe('The IP advertised to clients for connecting to the battle.'),
+	engineBindIP: z.ipv4()
 		.default('0.0.0.0')
 		.describe('The local IP/interface used by engine to bind the battle socket.'),
 	maxReconnectDelaySeconds: z.coerce
