@@ -22,14 +22,15 @@
   },
   "dependencies": {
     "@js-sdsl/deque": "^4.4.2",
+    "ajv": "^8.18.0",
+    "ajv-formats": "^3.0.1",
     "chokidar": "^4.0.3",
     "dotenv": "^17.3.1",
     "pino": "^9.6.0",
     "recoil-tdf": "^1.0.0",
     "tachyon-protocol": "1.13.0",
     "tiny-typed-emitter": "^2.1.0",
-    "ws": "^8.18.0",
-    "zod": "^4.3.6"
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
